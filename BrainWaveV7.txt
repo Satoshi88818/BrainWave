@@ -1,0 +1,702 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from sklearn.decomposition import PCA
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numba as nb
+from scipy.optimize import minimize
+import yaml
+import random
+# DEAP optional - with pure-numpy fallback for robustness
+try:
+    from deap import base, creator, tools
+    DEAP_AVAILABLE = True
+except ImportError:
+    DEAP_AVAILABLE = False
+    print("DEAP not available - using lightweight numpy-based exploration fallback")
+
+# ====================== BASE CONFIGURATION ======================
+# All hyperparameters in one place. New params for v7.0 highlighted.
+BASE_CONFIG = {
+    'nx': 380,
+    'ny': 380,
+    'c_fast': 0.58,
+    'c_slow': 0.1,
+    'dt': 1.0,
+    'damping_base': 0.992,
+    'num_particles': 6800,
+    'num_pacemakers': 8,
+    'num_neurons': 20,
+    'pml_width': 32,
+    'pml_strength': 0.935,
+    'pml_power': 3.0,
+    'nonlinear_coeff': 0.00185,
+    'nonlinear_soften_div': 10000,
+    'holo_write_rate_base': 0.0014,
+    'holo_decay': 0.99975,
+    'holo_mod_strength': 0.0011,
+    'holo_saturation': 45.0,
+    'engrave_boost_factor': 8.0,
+    'engrave_duration': 450,
+    'particle_grad_scale_factor': 0.01,
+    'particle_adv_factor_factor': 0.05,
+    'particle_vel_decay': 0.87,
+    'particle_pos_scale': 0.78,
+    'particle_vel_max': 5.8,
+    'particle_jitter_scale': 0.11,
+    'particle_stickiness_decay': 0.979,
+    'particle_stickiness_min': 0.68,
+    'particle_stickiness_max': 7.8,
+    'particle_stickiness_boost_max_pot': 24.0,
+    'particle_stickiness_boost_scale': 0.31,
+    'pacemaker_radius': 5,
+    'neuron_radius': 3,
+    'spike_threshold': 50.0,
+    'spike_impulse': 100.0,
+    'spike_cooldown': 30,
+    'pacemaker_boost_factor': 1.2,
+    'pacemaker_amp_cap': 60,
+    'readout_probe_omega': 0.62,
+    'readout_probe_amp': 31.0,
+    'readout_decay_tau': 38.0,
+    'readout_probe_width': 14,
+    'field_limit': 180.0,
+    'time_step': 0.072,
+    'noise_interval': 50,
+    'noise_scale': 1e-4,
+    'record_every': 100,
+    'pca_n_components': 5,
+    'drop_prob': 0.032,
+    'drop_intensity': 68,
+    'drop_width': 7,
+    'pattern_size': 48,
+    'pattern_amp': 95,
+    'pattern_margin': 60,
+    'particle_plot_fraction': 0.25,
+    'particle_size_base': 0.85,
+    'particle_size_scale': 0.62,
+    'adaptive_learning_rate': 0.01,
+    'fitness_target': 'readout_accuracy',
+    'seed': 42,                    # NEW v7.0 - reproducibility
+    'energy_log_interval': 500,    # NEW v7.0
+    'mlp_aug_noise': 0.08,         # NEW v7.0 - data augmentation
+}
+
+# ====================== NUMBA JIT CORE (unchanged but guarded) ======================
+@nb.njit(parallel=True)
+def update_particles_jit(particles, vel, stickiness, potential, gy, gx, du, jitter,
+                         nx, ny, grad_scale_base, adv_factor_base, adv_denom_base,
+                         adv_denom_scale, vel_decay, pos_scale, vel_max, jitter_denom_offset,
+                         stickiness_decay, stickiness_min, stickiness_max,
+                         stickiness_boost_max_pot, stickiness_boost_scale):
+    num_p = len(particles)
+    for i in nb.prange(num_p):
+        px = int(particles[i, 0])
+        py = int(particles[i, 1])
+        px = min(max(px, 0), nx - 1)
+        py = min(max(py, 0), ny - 1)
+        grad_scale = grad_scale_base * stickiness[i]
+        acc_grad_x = -gx[py, px] * grad_scale
+        acc_grad_y = -gy[py, px] * grad_scale
+        adv_factor = adv_factor_base / (adv_denom_base + stickiness[i] * adv_denom_scale)
+        acc_adv_x = du[py, px] * adv_factor
+        acc_adv_y = du[py, px] * adv_factor
+        vel[i, 0] += acc_grad_x + acc_adv_x
+        vel[i, 1] += acc_grad_y + acc_adv_y
+
+    vel *= vel_decay
+
+    for i in nb.prange(num_p):
+        vel[i, 0] += jitter[i, 0]
+        vel[i, 1] += jitter[i, 1]
+
+    for i in nb.prange(num_p):
+        if vel[i, 0] > vel_max:
+            vel[i, 0] = vel_max
+        elif vel[i, 0] < -vel_max:
+            vel[i, 0] = -vel_max
+        if vel[i, 1] > vel_max:
+            vel[i, 1] = vel_max
+        elif vel[i, 1] < -vel_max:
+            vel[i, 1] = -vel_max
+
+    for i in nb.prange(num_p):
+        particles[i, 0] += vel[i, 0] * pos_scale
+        particles[i, 1] += vel[i, 1] * pos_scale
+        if particles[i, 0] < 0:
+            particles[i, 0] = 0
+        elif particles[i, 0] > nx - 1:
+            particles[i, 0] = nx - 1
+        if particles[i, 1] < 0:
+            particles[i, 1] = 0
+        elif particles[i, 1] > ny - 1:
+            particles[i, 1] = ny - 1
+
+    for i in nb.prange(num_p):
+        px = int(particles[i, 0])
+        py = int(particles[i, 1])
+        px = min(max(px, 0), nx - 1)
+        py = min(max(py, 0), ny - 1)
+        local_pot = potential[py, px]
+        node_boost = max(0.0, stickiness_boost_max_pot - local_pot) / stickiness_boost_max_pot * stickiness_boost_scale
+        stickiness[i] *= stickiness_decay
+        stickiness[i] += node_boost
+        if stickiness[i] < stickiness_min:
+            stickiness[i] = stickiness_min
+        elif stickiness[i] > stickiness_max:
+            stickiness[i] = stickiness_max
+
+# ====================== CONFIG MANAGER ======================
+class ConfigManager:
+    def __init__(self, base_config):
+        self.config = base_config.copy()
+    
+    def load_from_file(self, filepath):
+        with open(filepath, 'r') as f:
+            loaded = yaml.safe_load(f)
+        self.config.update(loaded)
+    
+    def derive_parameters(self, sim):
+        self.config['particle_grad_scale_base'] = self.config['particle_grad_scale_factor'] * sim.c_fast
+        self.config['particle_adv_factor_base'] = self.config['particle_adv_factor_factor'] * sim.c_fast
+        self.config['particle_adv_denom_base'] = 0.8
+        self.config['particle_adv_denom_scale'] = 0.24
+        self.config['damping_fast'] = self.config['damping_base']
+        self.config['damping_slow'] = self.config['damping_base'] * 0.98
+
+# ====================== WAVE BRAIN SIMULATOR v7.0 - MONOLITHIC BUT MODULAR ======================
+class WaveBrainSimulator:
+    """
+    WaveBrainSimulator v7.0 - Monolithic class with internal modular sections.
+    All improvements integrated: state save/restore, energy monitoring,
+    DEAP guard + numpy fallback, seed, MLP augmentation, defensive indexing,
+    closed-loop everything preserved and hardened.
+    """
+    def __init__(self, config_manager):
+        self.config = config_manager.config
+        np.random.seed(self.config['seed'])
+        random.seed(self.config['seed'])
+        
+        self.nx = self.config['nx']
+        self.ny = self.config['ny']
+        self.c_fast = self.config['c_fast']
+        self.c_slow = self.config['c_slow']
+        self.dt = self.config['dt']
+        config_manager.derive_parameters(self)
+        
+        self.alpha2_fast = (self.c_fast * self.dt) ** 2
+        self.alpha2_slow = (self.c_slow * self.dt) ** 2
+        self.time = 0.0
+        self.coupling = 0.05
+        self.total_energy = 0.0  # NEW v7.0 energy monitor
+
+        # ==================== MODULE: WAVE FIELD ====================
+        self.u = np.zeros((3, self.ny, self.nx), dtype=np.complex128)
+        self.pml = self._build_pml()
+
+        # ==================== MODULE: HOLOGRAPHIC MEMORY ====================
+        self.hologram = np.zeros((self.ny, self.nx))
+        self.hologram_history = []
+        self.holo_write_rate = self.config['holo_write_rate_base']
+
+        # ==================== MODULE: PARTICLE SWARM ====================
+        self.particles = np.random.uniform(0, [self.nx, self.ny], (self.config['num_particles'], 2))
+        self.particle_vel = np.zeros((self.config['num_particles'], 2))
+        self.particle_stickiness = np.ones(self.config['num_particles']) * 1.0
+
+        # ==================== MODULE: READOUT & MLP ====================
+        self.readout_active = False
+        self.readout_signal = []
+        self.readout_counter = 0
+        self.readout_max_steps = 220
+        self.num_readout_points = 4
+        self.readout_history = []
+        self.pattern_labels = {'circle': 0, 'cross': 1, 'ring': 2}
+        self.last_pattern_type = None
+
+        input_size = self.readout_max_steps * self.num_readout_points
+        self.mlp = nn.Sequential(
+            nn.Linear(input_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 3)
+        )
+        self.optimizer = optim.Adam(self.mlp.parameters(), lr=0.01)
+        self.criterion = nn.CrossEntropyLoss()
+        self.trained = False
+
+        # ==================== MODULE: PACEMAKERS & NEURONS ====================
+        self.pacemaker_pos = np.random.randint(50, min(self.nx, self.ny)-50, (self.config['num_pacemakers'], 2))
+        self.pacemaker_freqs = np.random.uniform(0.2, 0.5, self.config['num_pacemakers'])
+        self.pacemaker_amps = np.random.uniform(20, 40, self.config['num_pacemakers'])
+        self.neuron_pos = np.random.randint(50, min(self.nx, self.ny)-50, (self.config['num_neurons'], 2))
+        self.spike_cooldown = np.zeros(self.config['num_neurons'])
+
+        # ==================== MODULE: OPTIMIZATION & EXPLORATION ====================
+        self.engrave_counter = 0
+        self.adaptive = True
+        self.step_count = 0
+        self.tunable_params = ['holo_write_rate_base', 'nonlinear_coeff']
+        
+        # DEAP setup (once, guarded)
+        self.toolbox = None
+        if DEAP_AVAILABLE:
+            if not hasattr(creator, 'FitnessMax'):
+                creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+                creator.create("Individual", list, fitness=creator.FitnessMax)
+            self.toolbox = base.Toolbox()
+            self.toolbox.register("attr_float", np.random.uniform, 0.001, 0.01)
+            self.toolbox.register("individual", tools.initRepeat, creator.Individual,
+                                  self.toolbox.attr_float, n=len(self.tunable_params))
+            self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
+
+    def _build_pml(self):
+        pml = np.ones((self.ny, self.nx))
+        w = self.config['pml_width']
+        sigma_x = np.zeros(self.nx)
+        for i in range(w):
+            factor = ((w - i) / w) ** self.config['pml_power']
+            sigma_x[i] = self.config['pml_strength'] * factor
+            sigma_x[-1 - i] = self.config['pml_strength'] * factor
+        sigma_y = np.zeros(self.ny)
+        for j in range(w):
+            factor = ((w - j) / w) ** self.config['pml_power']
+            sigma_y[j] = self.config['pml_strength'] * factor
+            sigma_y[-1 - j] = self.config['pml_strength'] * factor
+        sigma_x_grid = np.tile(sigma_x, (self.ny, 1))
+        sigma_y_grid = np.tile(sigma_y.reshape(-1, 1), (1, self.nx))
+        pml = np.exp(-np.maximum(sigma_x_grid, sigma_y_grid))
+        return pml
+
+    # ==================== STATE SAVE/RESTORE (NEW v7.0) ====================
+    def save_state(self):
+        return {
+            'u': self.u.copy(),
+            'hologram': self.hologram.copy(),
+            'particles': self.particles.copy(),
+            'particle_vel': self.particle_vel.copy(),
+            'particle_stickiness': self.particle_stickiness.copy(),
+            'pacemaker_amps': self.pacemaker_amps.copy(),
+            'pacemaker_pos': self.pacemaker_pos.copy(),  # positions fixed but safe
+            'time': self.time,
+            'step_count': self.step_count,
+            'engrave_counter': self.engrave_counter,
+            'holo_write_rate': self.holo_write_rate,
+        }
+
+    def restore_state(self, state):
+        self.u[:] = state['u']
+        self.hologram[:] = state['hologram']
+        self.particles[:] = state['particles']
+        self.particle_vel[:] = state['particle_vel']
+        self.particle_stickiness[:] = state['particle_stickiness']
+        self.pacemaker_amps[:] = state['pacemaker_amps']
+        self.pacemaker_pos[:] = state['pacemaker_pos']
+        self.time = state['time']
+        self.step_count = state['step_count']
+        self.engrave_counter = state['engrave_counter']
+        self.holo_write_rate = state['holo_write_rate']
+
+    def drop(self, intensity=None, width=None):
+        intensity = intensity or self.config['drop_intensity']
+        width = width or self.config['drop_width']
+        x = np.random.randint(width, self.nx - width)
+        y = np.random.randint(width, self.ny - width)
+        yy, xx = np.ogrid[-width:width, -width:width]
+        r2 = yy**2 + xx**2
+        mask = r2 < width**2
+        patch = intensity * np.exp(-r2 / (2 * width**2))
+        self.u[0, y-width:y+width, x-width:x+width].real[mask] += patch[mask]
+
+    def generate_pattern(self, ptype='circle', size=None, amp=None):
+        size = size or self.config['pattern_size']
+        amp = amp or self.config['pattern_amp']
+        h = size
+        yg, xg = np.ogrid[-h//2:h//2, -h//2:h//2]
+        if ptype == 'circle':
+            return (xg**2 + yg**2 < (h*0.45)**2).astype(float) * amp
+        elif ptype == 'cross':
+            pat = np.zeros((h, h))
+            pat[h//2-7:h//2+7, :] = amp
+            pat[:, h//2-7:h//2+7] = amp
+            return pat
+        elif ptype == 'ring':
+            r2 = xg**2 + yg**2
+            return ((r2 > (h*0.23)**2) & (r2 < (h*0.47)**2)).astype(float) * amp
+        return np.zeros((h, h))
+
+    def add_pattern(self, ptype='circle', cx=None, cy=None, amp=None):
+        amp = amp or self.config['pattern_amp']
+        if cx is None:
+            cx = np.random.randint(self.config['pattern_margin'], self.nx - self.config['pattern_margin'])
+        if cy is None:
+            cy = np.random.randint(self.config['pattern_margin'], self.ny - self.config['pattern_margin'])
+        pat = self.generate_pattern(ptype, amp=amp)
+        ph, pw = pat.shape
+        y1 = max(0, cy - ph//2)
+        y2 = min(self.ny, cy + ph//2)
+        x1 = max(0, cx - pw//2)
+        x2 = min(self.nx, cx + pw//2)
+        py1 = max(0, ph//2 - (cy - y1))
+        py2 = py1 + (y2 - y1)
+        px1 = max(0, pw//2 - (cx - x1))
+        px2 = px1 + (x2 - x1)
+        self.u[0, y1:y2, x1:x2].real += pat[py1:py2, px1:px2]
+        self.last_pattern_type = ptype
+        self.engrave_counter = self.config['engrave_duration']
+
+    def add_partial_cue(self):
+        if self.last_pattern_type is None:
+            print("No pattern stored yet for recall!")
+            return
+        pat = self.generate_pattern(self.last_pattern_type)
+        pat[pat.shape[0]//2:, :] = 0
+        pat[:, pat.shape[1]//2:] = 0
+        ph, pw = pat.shape
+        cy = np.random.randint(self.config['pattern_margin'], self.ny - self.config['pattern_margin'])
+        cx = np.random.randint(self.config['pattern_margin'], self.nx - self.config['pattern_margin'])
+        y1 = max(0, cy - ph//2)
+        y2 = min(self.ny, cy + ph//2)
+        x1 = max(0, cx - pw//2)
+        x2 = min(self.nx, cx + pw//2)
+        py1 = max(0, ph//2 - (cy - y1))
+        py2 = py1 + (y2 - y1)
+        px1 = max(0, pw//2 - (cx - x1))
+        px2 = px1 + (x2 - x1)
+        self.u[0, y1:y2, x1:x2].real += pat[py1:py2, px1:px2]
+        print(f"Added partial cue for {self.last_pattern_type} at random location")
+
+    def start_readout(self):
+        self.readout_active = True
+        self.readout_signal = []
+        self.readout_counter = 0
+        print("Probe readout started – sending test burst...")
+
+    def step(self):
+        u = self.u
+        u[2][:] = u[1]
+        u[1][:] = u[0]
+
+        lap = (u[1, 0:-2, 1:-1] + u[1, 2:, 1:-1] +
+               u[1, 1:-1, 0:-2] + u[1, 1:-1, 2:] -
+               4 * u[1, 1:-1, 1:-1])
+        lap_f = lap.real
+        lap_s = lap.imag
+
+        u1_int = u[1, 1:-1, 1:-1]
+        u2_int = u[2, 1:-1, 1:-1]
+        u_f1 = u1_int.real
+        u_s1 = u1_int.imag
+        u_f2 = u2_int.real
+        u_s2 = u2_int.imag
+
+        c2_local_fast = self.alpha2_fast * (1 + self.coupling * u_s1)
+        u0_int = u[0, 1:-1, 1:-1]
+        u0_int.real = c2_local_fast * lap_f + 2 * u_f1 - u_f2
+        u0_int.imag = self.alpha2_slow * lap_s + 2 * u_s1 - u_s2 + self.coupling * lap_f
+
+        if np.any(self.hologram != 0):
+            mod = self.config['holo_mod_strength'] * self.hologram[1:-1, 1:-1]
+            u0_int.real += mod * lap_f
+
+        u3 = u_f1**3
+        u0_int.real += self.config['nonlinear_coeff'] * np.tanh(u3 / self.config['nonlinear_soften_div']) * self.config['nonlinear_soften_div']
+
+        u0_int.real *= self.config['damping_fast']
+        u0_int.imag *= self.config['damping_slow']
+
+        u[0] *= self.pml
+
+        limit = self.config['field_limit']
+        u0_real = u[0].real
+        u0_imag = u[0].imag
+        u[0].real = u0_real * limit / (limit + np.abs(u0_real))
+        u[0].imag = u0_imag * limit / (limit + np.abs(u0_imag))
+
+        self.time += self.config['time_step']
+
+        # Pacemakers
+        for i in range(self.config['num_pacemakers']):
+            px, py = self.pacemaker_pos[i]
+            source = self.pacemaker_amps[i] * np.sin(self.pacemaker_freqs[i] * self.time)
+            radius = self.config['pacemaker_radius']
+            yy, xx = np.ogrid[-radius:radius+1, -radius:radius+1]
+            mask = (xx**2 + yy**2 <= radius**2)
+            y_start = max(0, py - radius)
+            x_start = max(0, px - radius)
+            patch_size_y = min(mask.shape[0], self.ny - y_start)
+            patch_size_x = min(mask.shape[1], self.nx - x_start)
+            patch = source * np.exp(-(xx**2 + yy**2) / (2 * radius**2))[mask[:patch_size_y, :patch_size_x]]
+            self.u[0, y_start:y_start+patch_size_y, x_start:x_start+patch_size_x].real[mask[:patch_size_y, :patch_size_x]] += patch
+
+        # Readout probe
+        if self.readout_active:
+            probe_source = self.config['readout_probe_amp'] * np.sin(self.config['readout_probe_omega'] * self.time) * max(0.0, np.exp(-self.readout_counter / self.config['readout_decay_tau']))
+            self.u[0, :, 0:self.config['readout_probe_width']].real += probe_source
+            self.readout_counter += 1
+            if self.readout_counter >= self.readout_max_steps:
+                self.readout_active = False
+                sig = np.array(self.readout_signal).flatten()
+                if self.last_pattern_type is not None:
+                    label = self.pattern_labels[self.last_pattern_type]
+                    self.readout_history.append((sig, label))
+                    peak = np.max(np.abs(sig))
+                    print(f"Readout finished for {self.last_pattern_type} → Peak: {peak:.3f}")
+                    if self.trained:
+                        pred = self.predict_pattern(self.readout_signal)
+                        print(f"MLP prediction: {pred}")
+                        if self.adaptive:
+                            sig_tensor = torch.from_numpy(sig).float().unsqueeze(0)
+                            confidence = torch.softmax(self.mlp(sig_tensor), dim=1).max().item()
+                            self.holo_write_rate *= (1 + 0.1 * (confidence - 0.5))
+                else:
+                    print("Readout finished but no pattern label")
+
+        if self.readout_active:
+            right_response = self.u[0, :, -1].real
+            means = []
+            segment_size = self.ny // self.num_readout_points
+            for i in range(self.num_readout_points):
+                start = i * segment_size
+                end = min((i + 1) * segment_size, self.ny) if i < self.num_readout_points - 1 else self.ny
+                means.append(np.mean(np.abs(right_response[start:end])))
+            self.readout_signal.append(means)
+
+        # Neurons
+        for i in range(self.config['num_neurons']):
+            if self.spike_cooldown[i] > 0:
+                self.spike_cooldown[i] -= 1
+                continue
+            py, px = self.neuron_pos[i]
+            if abs(self.u[0, py, px].real) > self.config['spike_threshold']:
+                radius = self.config['neuron_radius']
+                yy, xx = np.ogrid[-radius:radius+1, -radius:radius+1]
+                mask = (xx**2 + yy**2 <= radius**2)
+                y_start = max(0, py - radius)
+                x_start = max(0, px - radius)
+                patch_size_y = min(mask.shape[0], self.ny - y_start)
+                patch_size_x = min(mask.shape[1], self.nx - x_start)
+                impulse_patch = self.config['spike_impulse'] * np.exp(-(xx**2 + yy**2) / (2 * radius**2))[mask[:patch_size_y, :patch_size_x]]
+                self.u[0, y_start:y_start+patch_size_y, x_start:x_start+patch_size_x].real[mask[:patch_size_y, :patch_size_x]] += impulse_patch
+                dists = np.linalg.norm(self.pacemaker_pos - np.array([px, py]), axis=1)
+                nearest = np.argmin(dists)
+                self.pacemaker_amps[nearest] *= self.config['pacemaker_boost_factor']
+                self.pacemaker_amps[nearest] = min(self.pacemaker_amps[nearest], self.config['pacemaker_amp_cap'])
+                self.spike_cooldown[i] = self.config['spike_cooldown']
+                print(f"Spike at neuron {i}! Boosted pacemaker {nearest}")
+
+        # Hologram engraving
+        rate = self.holo_write_rate
+        if self.engrave_counter > 0:
+            rate *= self.config['engrave_boost_factor']
+            self.engrave_counter -= 1
+        interference = self.u[0].real * self.u[1].real
+        energy = np.sqrt(self.u[0].real**2 + self.u[1].real**2 + 1e-8)
+        interference /= energy
+        self.hologram += rate * interference
+        self.hologram = np.tanh(self.hologram / self.config['holo_saturation']) * self.config['holo_saturation']
+        self.hologram *= self.config['holo_decay']
+
+        self.step_count += 1
+
+        # Noise
+        if self.step_count % self.config['noise_interval'] == 0:
+            self.u[0].real += np.random.normal(0, self.config['noise_scale'], (self.ny, self.nx))
+
+        # Energy monitoring (NEW v7.0)
+        self.total_energy = np.sum(np.abs(self.u[0])**2)
+        if self.step_count % self.config['energy_log_interval'] == 0:
+            print(f"Step {self.step_count:6d} | Energy: {self.total_energy:12.2f} | Holo-rate: {self.holo_write_rate:.6f}")
+
+        # Record for PCA
+        if self.step_count % self.config['record_every'] == 0:
+            self.hologram_history.append(self.hologram.flatten().copy())
+            if len(self.hologram_history) > 50:
+                self.hologram_history.pop(0)
+
+    def update_particles(self):
+        potential = self.u[0].real ** 2 + 0.5 * self.u[0].imag ** 2
+        gy, gx = np.gradient(potential)
+        du = self.u[0].real - self.u[1].real
+        jitter_scale = self.config['particle_jitter_scale'] / np.sqrt(self.particle_stickiness + 0.2)
+        jitter = np.random.randn(self.particles.shape[0], 2) * jitter_scale[:, np.newaxis]
+        update_particles_jit(
+            self.particles, self.particle_vel, self.particle_stickiness, potential, gy, gx, du, jitter,
+            self.nx, self.ny,
+            self.config['particle_grad_scale_base'], self.config['particle_adv_factor_base'],
+            self.config['particle_adv_denom_base'], self.config['particle_adv_denom_scale'],
+            self.config['particle_vel_decay'], self.config['particle_pos_scale'], self.config['particle_vel_max'],
+            0.2, self.config['particle_stickiness_decay'], self.config['particle_stickiness_min'],
+            self.config['particle_stickiness_max'], self.config['particle_stickiness_boost_max_pot'],
+            self.config['particle_stickiness_boost_scale']
+        )
+
+    def perform_pca(self):
+        if len(self.hologram_history) < 5:
+            print("Not enough hologram history for PCA")
+            return
+        hist = np.array(self.hologram_history)
+        pca = PCA(n_components=self.config['pca_n_components'])
+        self.pca_components = pca.fit_transform(hist)
+        print("PCA performed. Explained variance:", pca.explained_variance_ratio_)
+        fig_pca = plt.figure()
+        plt.imshow(pca.components_[0].reshape(self.ny, self.nx), cmap='viridis')
+        plt.title("First PCA Component")
+        plt.show()
+
+    # ==================== MLP WITH AUGMENTATION (NEW v7.0) ====================
+    def train_mlp(self):
+        if len(self.readout_history) < 3:
+            print("Not enough readout data to train MLP")
+            return
+        X = np.array([sig for sig, _ in self.readout_history])
+        y = np.array([label for _, label in self.readout_history])
+        
+        # Data augmentation
+        aug_X = []
+        aug_y = []
+        for sig, label in zip(X, y):
+            aug_X.append(sig)
+            aug_y.append(label)
+            for _ in range(3):  # 3 noisy copies
+                noisy = sig + np.random.normal(0, self.config['mlp_aug_noise'], sig.shape)
+                aug_X.append(noisy)
+                aug_y.append(label)
+        
+        X_tensor = torch.from_numpy(np.array(aug_X)).float()
+        y_tensor = torch.from_numpy(np.array(aug_y)).long()
+        
+        for epoch in range(300):
+            self.optimizer.zero_grad()
+            out = self.mlp(X_tensor)
+            loss = self.criterion(out, y_tensor)
+            loss.backward()
+            self.optimizer.step()
+            if epoch % 50 == 0:
+                print(f"Epoch {epoch:3d}, Loss: {loss.item():.4f}")
+        self.trained = True
+        print("MLP trained with augmentation")
+
+    def predict_pattern(self, signal):
+        if not self.trained:
+            return None
+        sig_tensor = torch.from_numpy(np.array(signal).flatten()).float().unsqueeze(0)
+        out = self.mlp(sig_tensor)
+        pred = torch.argmax(out).item()
+        patterns = {v: k for k, v in self.pattern_labels.items()}
+        return patterns.get(pred, "Unknown")
+
+    # ==================== IN-SITU OPTIMIZATION (hardened with state save) ====================
+    def compute_fitness(self, params):
+        saved = self.save_state()
+        for i, key in enumerate(self.tunable_params):
+            self.config[key] = params[i]
+        self.add_pattern('circle')
+        for _ in range(50):
+            self.step()
+        self.start_readout()
+        while self.readout_active:
+            self.step()
+        if self.readout_signal:
+            peak = np.max(np.abs(np.array(self.readout_signal).flatten()))
+            fitness = -peak
+        else:
+            fitness = 0
+        self.restore_state(saved)
+        return fitness
+
+    def optimize_params(self, num_iters=10):
+        initial_params = [self.config[key] for key in self.tunable_params]
+        res = minimize(self.compute_fitness, initial_params, method='Nelder-Mead',
+                       options={'maxiter': num_iters, 'disp': False})
+        for i, key in enumerate(self.tunable_params):
+            self.config[key] = res.x[i]
+        print(f"Optimized params: {dict(zip(self.tunable_params, res.x))}")
+
+    # ==================== BEHAVIOR EXPLORATION (DEAP or numpy fallback) ====================
+    def explore_behaviors(self, num_samples=20):
+        behaviors = []
+        if DEAP_AVAILABLE and self.toolbox is not None:
+            pop = self.toolbox.population(n=num_samples)
+            for ind in pop:
+                fitness = self.compute_fitness(ind)
+                behaviors.append((ind, fitness))
+        else:
+            # Pure numpy fallback
+            for _ in range(num_samples):
+                ind = np.random.uniform(0.001, 0.01, len(self.tunable_params))
+                fitness = self.compute_fitness(ind)
+                behaviors.append((ind.tolist(), fitness))
+        behaviors.sort(key=lambda x: x[1])
+        print("Explored behaviors (sorted by fitness):")
+        for b in behaviors[:5]:
+            print(b)
+        return behaviors
+
+# ====================== MAIN EXECUTABLE BLOCK ======================
+if __name__ == "__main__":
+    config_mgr = ConfigManager(BASE_CONFIG)
+    sim = WaveBrainSimulator(config_mgr)
+
+    # Quick demo optimizations
+    print("Running quick in-situ optimization...")
+    sim.optimize_params(num_iters=5)
+    print("Exploring behaviors...")
+    sim.explore_behaviors(num_samples=8)
+
+    # ====================== LIVE VISUALIZATION ======================
+    fig, ax = plt.subplots(figsize=(9.5, 9.5), facecolor='black')
+    ax.axis('off')
+    img = ax.imshow(sim.u[0].real, cmap='plasma', vmin=-72, vmax=125, interpolation='bilinear')
+    sc = ax.scatter(sim.particles[:, 0], sim.particles[:, 1], s=1.1,
+                    c=sim.particle_stickiness, cmap='hot', vmin=0.7, vmax=7.8, alpha=0.9, linewidth=0)
+
+    ax_holo = fig.add_axes([0.75, 0.75, 0.22, 0.22])
+    ax_holo.axis('off')
+    img_holo = ax_holo.imshow(sim.hologram, cmap='viridis', vmin=-35, vmax=35, interpolation='bilinear', alpha=0.7)
+
+    ax_slow = fig.add_axes([0.05, 0.75, 0.22, 0.22])
+    ax_slow.axis('off')
+    img_slow = ax_slow.imshow(sim.u[0].imag, cmap='coolwarm', vmin=-50, vmax=50, interpolation='bilinear', alpha=0.7)
+
+    def animate(frame):
+        if np.random.rand() < sim.config['drop_prob']:
+            sim.drop()
+        sim.step()
+        sim.update_particles()
+        img.set_data(sim.u[0].real)
+        num_plot = int(len(sim.particles) * sim.config['particle_plot_fraction'])
+        idx = np.random.choice(len(sim.particles), num_plot, replace=False)
+        sc.set_offsets(sim.particles[idx])
+        sc.set_array(sim.particle_stickiness[idx])
+        sc.set_sizes(sim.config['particle_size_base'] + sim.particle_stickiness[idx] * sim.config['particle_size_scale'])
+        img_holo.set_data(sim.hologram)
+        img_slow.set_data(sim.u[0].imag)
+        return [img, sc, img_holo, img_slow]
+
+    ani = FuncAnimation(fig, animate, interval=16, blit=True, cache_frame_data=False)
+
+    def on_key(event):
+        if event.key == '1': sim.add_pattern('circle')
+        elif event.key == '2': sim.add_pattern('cross')
+        elif event.key == '3': sim.add_pattern('ring')
+        elif event.key == 'd':
+            for _ in range(10): sim.drop()
+        elif event.key == 'r': sim.add_partial_cue()
+        elif event.key == 'p': sim.start_readout()
+        elif event.key == 'c': sim.perform_pca()
+        elif event.key == 't': sim.train_mlp()
+        elif event.key == 'o': sim.optimize_params()
+        elif event.key == 'e': sim.explore_behaviors()
+        elif event.key == 'q': plt.close()
+
+    fig.canvas.mpl_connect('key_press_event', on_key)
+
+    print("\n=== WaveBrainSimulator v7.0 READY ===")
+    print("Keys: 1=circle  2=cross  3=ring  d=10 drops  r=partial cue  p=probe  c=PCA  t=train MLP  o=optimize  e=explore  q=quit")
+    print("Energy logged every 500 steps. State-safe optimization active.")
+    plt.tight_layout()
+    plt.show()
